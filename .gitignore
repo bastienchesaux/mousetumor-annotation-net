@@ -2,4 +2,4 @@ data/
 *.ipynb
 .vscode/
 *.lprof
-
+__pycache__/
