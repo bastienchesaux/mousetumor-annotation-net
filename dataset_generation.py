@@ -1,0 +1,348 @@
+import logging
+
+from tqdm import tqdm
+
+import pandas as pd
+import numpy as np
+
+import tifffile as tiff
+import os
+import re
+import json
+
+import typer
+from typing import Annotated
+from pathlib import Path
+
+
+import edt
+
+from scipy.ndimage import distance_transform_cdt
+
+
+app = typer.Typer()
+
+
+def full_scan_normalize_hu(image, lb=-1000, ub=500):
+    """Scale intensity range using  typical HU range for soft tissue ([-1000, 500])"""
+    normalized = (image - lb) / (ub - lb)
+    normalized = np.clip(normalized, 0, 1)
+    return normalized
+
+
+def full_scan_normalize(image, clip_percentile=96):
+    ub = np.percentile(image, 96)
+    lb = image.min()
+
+    normalized = (image - lb) / (ub - lb)
+    normalized = np.clip(normalized, 0, 1)
+    return normalized
+
+
+def extract_binary_tight(labelled: np.ndarray, label: int, pad_width: int = 5):
+    """
+    Extracts the binary image of a target label with minimal dimensions.
+
+    Args:
+    - labelled (np.ndarray): input labelled image
+    - label (int): target label
+    - pad_width (int): number of layers of zero-padding around the cuboid in the binary output
+
+    Returns:
+    - binary (np.ndarray): tight binary image of the target label
+    - z0, z1, y0, y1, x0, x1 (int): x, y, and z position of the binary image in the original labelled image
+    """
+
+    if not np.any(labelled == label):
+        print(f"Label{label} doesn't appear in provided image")
+        return None
+
+    z, y, x = np.where(labelled == label)
+
+    # padding is necessary for mesh generation, the cuboid can't touch the border of the binary image
+    z0, z1 = z.min() - pad_width, z.max() + pad_width + 1
+    y0, y1 = y.min() - pad_width, y.max() + pad_width + 1
+    x0, x1 = x.min() - pad_width, x.max() + pad_width + 1
+
+    z0 = max(z0, 0)
+    z1 = min(z1, labelled.shape[0])
+    y0 = max(y0, 0)
+    y1 = min(y1, labelled.shape[1])
+    x0 = max(x0, 0)
+    x1 = min(x1, labelled.shape[2])
+
+    tight = labelled[z0:z1, y0:y1, x0:x1]
+    binary = (tight == label).astype(bool)
+
+    return binary, np.array([z0, y0, x0])
+
+
+def noisy_tumor_center(binary, dist_quantile=0.96):
+    dist = edt.edt(binary)
+
+    thresh = np.quantile(dist[dist != 0], dist_quantile)
+    if np.count_nonzero(dist > thresh) == 0:
+        logging.info("invalid threshold, using default")
+    thresh = min(thresh, dist.max() - 2)  # safety for very small tumors
+
+    valid_coords = np.stack(np.where(dist > thresh), -1)
+
+    noisy_center = valid_coords[np.random.choice(len(valid_coords))]
+
+    return np.array(noisy_center)
+
+
+def extract_tumor_window(img, labels, target_label, win_size, dist_quantile=0.96):
+    binary, offset = extract_binary_tight(labels, target_label)
+
+    win_center = noisy_tumor_center(binary, dist_quantile=dist_quantile) + offset
+
+    if labels[win_center[0], win_center[1], win_center[2]] != target_label:
+        logging.warning("window center outside of tumor")
+
+    half = win_size // 2
+
+    img_padded = np.pad(img, half, mode="constant", constant_values=0)
+    lbl_padded = np.pad(labels, half, mode="constant", constant_values=0)
+
+    # center is shifted by half due to padding
+    z, y, x = win_center + half
+
+    img_win = img_padded[
+        z - half : z + half + win_size % 2,
+        y - half : y + half + win_size % 2,
+        x - half : x + half + win_size % 2,
+    ]
+    lbl_win = lbl_padded[
+        z - half : z + half + win_size % 2,
+        y - half : y + half + win_size % 2,
+        x - half : x + half + win_size % 2,
+    ]
+
+    lbl_win = lbl_win == target_label
+    lbl_win = lbl_win.astype(bool)
+
+    return img_win, lbl_win
+
+
+@app.command()
+def generate_tumor_windows(
+    source_scan_dir: Annotated[Path, typer.Argument()],
+    dataset_dir: Annotated[Path, typer.Argument()],
+    win_size: Annotated[int, typer.Argument()],
+):
+    if not os.path.isdir(dataset_dir):
+        os.mkdir(dataset_dir)
+        os.mkdir(os.path.join(dataset_dir, "images"))
+        os.mkdir(os.path.join(dataset_dir, "labels"))
+
+    scans_df = pd.read_csv(os.path.join(source_scan_dir, "scan.csv"))
+    scans_df["time_tag"] = scans_df["time_tag"].str.lower()
+
+    for (case, scan), group in tqdm(scans_df.groupby(["specimen", "time_tag"])):
+        if not {"roi", "corrected_pred"}.issubset(group["class"].unique()):
+            logging.warning(f"{case} {scan} not a valid file pair")
+            continue
+
+        img_name = "_".join([case, scan, "roi.tiff"])
+        labels_name = "_".join([case, scan, "corrected_pred.tiff"])
+
+        img = tiff.imread(os.path.join(source_scan_dir, img_name))
+        labels = tiff.imread(os.path.join(source_scan_dir, labels_name))
+
+        img = full_scan_normalize(img)
+
+        for i in np.unique(labels[labels != 0]):
+            img_win, label_win = extract_tumor_window(img, labels, i, win_size)
+
+            output_name = "_".join([case, scan, f"tum{i}.tiff"])
+
+            tiff.imwrite(os.path.join(dataset_dir, "images", output_name), img_win)
+            tiff.imwrite(os.path.join(dataset_dir, "labels", output_name), label_win)
+
+
+def random_empty_window_center(labels, mask, win_size):
+    background = labels == 0
+
+    chebyshev_dist = distance_transform_cdt(background)
+
+    valid_win_locations = chebyshev_dist > win_size
+
+    dist_to_edge = win_size // 2 + 1
+
+    valid_win_locations[:dist_to_edge, :, :] = 0
+    valid_win_locations[-dist_to_edge:, :, :] = 0
+
+    valid_win_locations[:, :dist_to_edge, :] = 0
+    valid_win_locations[:, -dist_to_edge:, :] = 0
+
+    valid_win_locations[:, :, :dist_to_edge] = 0
+    valid_win_locations[:, :, -dist_to_edge:] = 0
+
+    valid_win_locations *= mask
+
+    if np.count_nonzero(valid_win_locations) == 0:
+        return None
+
+    valid_coords = np.stack(np.where(valid_win_locations), -1)
+
+    noisy_center = valid_coords[np.random.choice(len(valid_coords))]
+
+    return noisy_center
+
+
+def extract_empty_window(img, labels, lung_mask, win_size):
+    win_center = random_empty_window_center(labels, lung_mask, win_size)
+
+    if win_center is None:
+        return None, None
+
+    half = win_size // 2
+
+    img_padded = np.pad(img, half, mode="constant", constant_values=0)
+    lbl_padded = np.pad(labels, half, mode="constant", constant_values=0)
+
+    # center is shifted by half due to padding
+    z, y, x = win_center + half
+
+    img_win = img_padded[
+        z - half : z + half + win_size % 2,
+        y - half : y + half + win_size % 2,
+        x - half : x + half + win_size % 2,
+    ]
+    lbl_win = lbl_padded[
+        z - half : z + half + win_size % 2,
+        y - half : y + half + win_size % 2,
+        x - half : x + half + win_size % 2,
+    ]
+
+    lbl_win = lbl_win != 0
+    lbl_win = lbl_win.astype(bool)
+
+    return img_win, lbl_win
+
+
+@app.command()
+def generate_empty_windows(
+    source_scan_dir: Annotated[Path, typer.Argument()],
+    dataset_dir: Annotated[Path, typer.Argument()],
+    win_size: Annotated[int, typer.Argument()],
+    n: Annotated[int, typer.Argument(help="number of windows to generate")],
+):
+    if not os.path.isdir(dataset_dir):
+        os.mkdir(dataset_dir)
+        os.mkdir(os.path.join(dataset_dir, "images"))
+        os.mkdir(os.path.join(dataset_dir, "labels"))
+
+    lung_files = [
+        file for file in os.listdir(source_scan_dir) if file.endswith("lung_mask.tiff")
+    ]
+
+    valid_count = 0
+
+    pbar = tqdm(total=n)
+
+    while valid_count < n:
+        random_file = np.random.choice(lung_files)
+
+        pattern = r"(?P<case>C\d{5})_scan(?P<scan_no>\d+)_"
+
+        match = re.search(pattern, random_file)
+        if not match:
+            logging.error(f"pattern not found in {random_file}")
+            continue
+        case = match.group("case")
+        scan = "scan" + match.group("scan_no")
+
+        img_name = "_".join([case, scan, "roi.tiff"])
+        labels_name = "_".join([case, scan, "corrected_pred.tiff"])
+
+        img = tiff.imread(os.path.join(source_scan_dir, img_name))
+        labels = tiff.imread(os.path.join(source_scan_dir, labels_name))
+        lung_mask = tiff.imread(os.path.join(source_scan_dir, random_file))
+
+        img = full_scan_normalize(img)
+
+        img_win, label_win = extract_empty_window(img, labels, lung_mask, win_size)
+
+        if img_win is None:
+            continue
+
+        if np.count_nonzero(label_win) > 0:
+            logging.error("window is not empty")
+            continue
+
+        output_name = "_".join([case, scan, f"empty{valid_count}.tiff"])
+
+        tiff.imwrite(os.path.join(dataset_dir, "images", output_name), img_win)
+        tiff.imwrite(os.path.join(dataset_dir, "labels", output_name), label_win)
+
+        valid_count += 1
+        pbar.update(1)
+
+    pbar.close()
+
+
+def split_prompt():
+    while True:
+        raw = typer.prompt("Train Val Test (e.g. 80 10 10)")
+        try:
+            values = tuple(int(x) for x in raw.split())
+            if len(values) != 3:
+                raise ValueError
+            if sum(values) != 100:
+                typer.echo("Values must sum to 100, try again.")
+                continue
+            return values
+        except ValueError:
+            typer.echo("Please enter 3 integers, try again.")
+
+
+def split_files(files, split):
+    files = np.random.choice(files, len(files), replace=False)
+    n = len(files)
+    train_end = int(np.ceil(n * split[0] / 100))
+    val_end = train_end + int(n * split[1] / 100)
+
+    splits = [files[:train_end], files[train_end:val_end], files[val_end:]]
+    labels = ["train", "val", "test"]
+
+    return {f: label for files, label in zip(splits, labels) for f in files}
+
+
+@app.command()
+def generate_datalist(dataset_dir: Annotated[Path, typer.Argument()]):
+    split_percent = split_prompt()
+
+    datalist = {"train": [], "val": [], "test": []}
+
+    tumor_files = [
+        file
+        for file in os.listdir(os.path.join(dataset_dir, "images"))
+        if "tum" in file
+    ]
+    empty_files = [
+        file
+        for file in os.listdir(os.path.join(dataset_dir, "images"))
+        if "empty" in file
+    ]
+
+    tumor_files_split = split_files(tumor_files, split_percent)
+    empty_files_split = split_files(empty_files, split_percent)
+
+    files_split = {**tumor_files_split, **empty_files_split}
+
+    for file, split_dest in files_split.items():
+        datalist[split_dest].append(
+            {
+                "image": os.path.join("images", file),
+                "label": os.path.join("labels", file),
+            }
+        )
+
+    with open(os.path.join(dataset_dir, "datalist.json"), "w") as f:
+        json.dump(datalist, f, indent=2)
+
+
+if __name__ == "__main__":
+    app()
