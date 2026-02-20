@@ -21,6 +21,8 @@ from mesh_viewer import MeshViewer
 
 import edt
 
+from scipy.ndimage import distance_transform_cdt
+
 
 app = typer.Typer()
 
@@ -237,7 +239,7 @@ def threshold_edt(binary):
 
 
 @app.command()
-def test_edt_erosion(
+def demo_tumor_edt_erosion(
     image_dir: Annotated[Path, typer.Argument()],
     seed: Annotated[
         int | None, typer.Option(help="seed for random selection of a tumor")
@@ -261,6 +263,52 @@ def test_edt_erosion(
     binary = extract_binary_tight(labels, tumor_idx, pad_width=5)
 
     threshold_edt(binary)
+
+
+@app.command()
+def demo_find_empty_window(
+    image_dir: Annotated[Path, typer.Argument()],
+    winsize: Annotated[int, typer.Argument()],
+    seed: Annotated[
+        int | None, typer.Option(help="seed for random selection of a tumor")
+    ] = None,
+    dist_to_edge: Annotated[int, typer.Option()] = 0,
+):
+    if seed is not None:
+        np.random.seed(seed)
+
+    label_files = [
+        file for file in os.listdir(image_dir) if file.endswith("corrected_pred.tiff")
+    ]
+
+    random_file = np.random.choice(label_files)
+
+    labels = tiff.imread(os.path.join(image_dir, random_file))
+
+    background = labels == 0
+
+    chebyshev_dist = distance_transform_cdt(background)
+
+    valid_win_locations = chebyshev_dist > winsize
+
+    dist_to_edge = min(winsize // 2, dist_to_edge)
+
+    valid_win_locations[:dist_to_edge, :, :] = 0
+    valid_win_locations[-dist_to_edge:, :, :] = 0
+
+    valid_win_locations[:, :dist_to_edge, :] = 0
+    valid_win_locations[:, -dist_to_edge:, :] = 0
+
+    valid_win_locations[:, :, :dist_to_edge] = 0
+    valid_win_locations[:, :, -dist_to_edge:] = 0
+
+    viewer = napari.Viewer()
+
+    viewer.add_image(chebyshev_dist, name="dist")
+    viewer.add_labels(labels, name="labels")
+    viewer.add_labels(3 * valid_win_locations.astype(int), name="valid_windows")
+
+    napari.run()
 
 
 if __name__ == "__main__":

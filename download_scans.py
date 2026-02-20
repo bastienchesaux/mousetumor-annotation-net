@@ -3,6 +3,8 @@ from depalma_napari_omero.omero_client._project import (
     OmeroClient,
 )
 
+from mousetumorpy import LungsPredictor
+
 from getpass import getpass, getuser
 from tqdm import tqdm
 
@@ -117,7 +119,9 @@ def download_scans(save_dir: Annotated[Path, typer.Argument()]):
 
     file_subset_df.to_csv(os.path.join(save_dir, "scan.csv"))
 
-    for idx, row in tqdm(file_subset_df.iterrows(), desc="Downloading Images"):
+    for idx, row in tqdm(
+        file_subset_df.iterrows(), desc="Downloading Images", total=len(file_subset_df)
+    ):
         image_arr = omero_client.download_image(image_id=row["image_id"])
         file_name = "_".join([row["specimen"], row["time_tag"].lower(), row["class"]])
 
@@ -126,6 +130,24 @@ def download_scans(save_dir: Annotated[Path, typer.Argument()]):
         tiff.imwrite(save_path, image_arr)
 
     omero_client.quit()
+
+
+@app.command()
+def generate_lung_masks(
+    image_dir: Annotated[Path, typer.Argument()],
+    model: Annotated[str, typer.Option()] = "v1",
+):
+    predictor = LungsPredictor(model)
+
+    image_files = [file for file in os.listdir(image_dir) if file.endswith("roi.tiff")]
+
+    for file in tqdm(image_files, desc="Constructing lungs masks"):
+        image = tiff.imread(os.path.join(image_dir, file))
+        lung_mask = predictor.fast_predict(image, skip_level=2)
+
+        lung_filename = file.removesuffix("roi.tiff") + "lungs_mask.tiff"
+
+        tiff.imwrite(os.path.join(image_dir, lung_filename), lung_mask.astype(bool))
 
 
 if __name__ == "__main__":
