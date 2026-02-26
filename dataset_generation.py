@@ -95,17 +95,20 @@ def noisy_tumor_center(binary, dist_quantile=0.96):
 def extract_tumor_window(img, labels, target_label, win_size, dist_quantile=0.96):
     binary, offset = extract_binary_tight(labels, target_label)
 
+    if any(dim > win_size for dim in binary.shape):
+        raise RuntimeError(f"Tumor doesn't fit in {win_size}³ window")
+
     win_center = noisy_tumor_center(binary, dist_quantile=dist_quantile) + offset
 
     if labels[win_center[0], win_center[1], win_center[2]] != target_label:
-        logging.warning("window center outside of tumor")
+        raise RuntimeError(f"Window center {win_center} outside of tumor")
 
     half = win_size // 2
 
     img_padded = np.pad(img, half, mode="constant", constant_values=0)
     lbl_padded = np.pad(labels, half, mode="constant", constant_values=0)
 
-    # center is shifted by half due to padding
+    # center is shifted by half because of padding
     z, y, x = win_center + half
 
     img_win = img_padded[
@@ -130,6 +133,7 @@ def generate_tumor_windows(
     source_scan_dir: Annotated[Path, typer.Argument()],
     dataset_dir: Annotated[Path, typer.Argument()],
     win_size: Annotated[int, typer.Argument()],
+    skip_existing: Annotated[bool, typer.Option()] = False,
 ):
     if not os.path.isdir(dataset_dir):
         os.mkdir(dataset_dir)
@@ -153,12 +157,29 @@ def generate_tumor_windows(
         img = full_scan_normalize(img)
 
         for i in np.unique(labels[labels != 0]):
-            img_win, label_win = extract_tumor_window(img, labels, i, win_size)
+            try:
+                output_name = "_".join([case, scan, f"tum{i}.tiff"])
+                img_path = os.path.join(dataset_dir, "images", output_name)
+                lbl_path = os.path.join(dataset_dir, "labels", output_name)
+                if (
+                    skip_existing
+                    and os.path.isfile(img_path)
+                    and os.path.isfile(lbl_path)
+                ):
+                    continue
 
-            output_name = "_".join([case, scan, f"tum{i}.tiff"])
+                img_win, label_win = extract_tumor_window(img, labels, i, win_size)
 
-            tiff.imwrite(os.path.join(dataset_dir, "images", output_name), img_win)
-            tiff.imwrite(os.path.join(dataset_dir, "labels", output_name), label_win)
+                tiff.imwrite(
+                    img_path,
+                    img_win.astype(np.float32),
+                )
+                tiff.imwrite(
+                    lbl_path,
+                    label_win.astype(np.uint8),
+                )
+            except Exception as e:
+                logging.error(f"Failed to generate {output_name} with {e}")
 
 
 def random_empty_window_center(labels, mask, win_size):
@@ -274,8 +295,12 @@ def generate_empty_windows(
 
         output_name = "_".join([case, scan, f"empty{valid_count}.tiff"])
 
-        tiff.imwrite(os.path.join(dataset_dir, "images", output_name), img_win)
-        tiff.imwrite(os.path.join(dataset_dir, "labels", output_name), label_win)
+        tiff.imwrite(
+            os.path.join(dataset_dir, "images", output_name), img_win.astype(np.float32)
+        )
+        tiff.imwrite(
+            os.path.join(dataset_dir, "labels", output_name), label_win.astype(np.uint8)
+        )
 
         valid_count += 1
         pbar.update(1)
@@ -311,7 +336,11 @@ def split_files(files, split):
 
 
 @app.command()
-def generate_datalist(dataset_dir: Annotated[Path, typer.Argument()]):
+def generate_datalist(
+    dataset_dir: Annotated[Path, typer.Argument()],
+    n_files: Annotated[int | None, typer.Option("--n-files", "-n")] = None,
+    name: Annotated[str, typer.Option()] = "datalist.json",
+):
     split_percent = split_prompt()
 
     datalist = {"train": [], "val": [], "test": []}
@@ -327,6 +356,17 @@ def generate_datalist(dataset_dir: Annotated[Path, typer.Argument()]):
         if "empty" in file
     ]
 
+    tumor_fraction = len(tumor_files) / (len(tumor_files) + len(empty_files))
+
+    typer.echo(f"Tumor fraction: {100 * tumor_fraction:.1f}%")
+
+    if n_files is not None:
+        n_tumor_files = int(np.ceil(n_files * tumor_fraction))
+        n_empty_files = n_files - n_tumor_files
+
+        tumor_files = np.random.choice(tumor_files, size=n_tumor_files, replace=False)
+        empty_files = np.random.choice(empty_files, size=n_empty_files, replace=False)
+
     tumor_files_split = split_files(tumor_files, split_percent)
     empty_files_split = split_files(empty_files, split_percent)
 
@@ -340,7 +380,7 @@ def generate_datalist(dataset_dir: Annotated[Path, typer.Argument()]):
             }
         )
 
-    with open(os.path.join(dataset_dir, "datalist.json"), "w") as f:
+    with open(os.path.join(dataset_dir, name), "w") as f:
         json.dump(datalist, f, indent=2)
 
 

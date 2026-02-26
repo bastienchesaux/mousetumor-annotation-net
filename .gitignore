@@ -1,4 +1,5 @@
 data/
+training/
 *.ipynb
 .vscode/
 *.lprof

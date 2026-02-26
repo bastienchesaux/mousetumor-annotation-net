@@ -155,6 +155,10 @@ def tumor_extents_histogram(image_dir: Annotated[Path, typer.Argument()]):
     df["min_extent"] = df["extents"].apply(min)
     df["max_extent"] = df["extents"].apply(max)
 
+    smaller_than_window_percent = 100 * (df["max_extent"] > 64).sum() / len(df)
+
+    print(f"{smaller_than_window_percent}% or windows are larger than windows")
+
     min_p2 = df["min_extent"].quantile(0.02)
     min_p98 = df["min_extent"].quantile(0.98)
     max_p2 = df["max_extent"].quantile(0.02)
