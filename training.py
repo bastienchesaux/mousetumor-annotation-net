@@ -1,4 +1,5 @@
 import os
+import inspect
 import json
 import shutil
 import logging
@@ -53,18 +54,20 @@ logger = logging.getLogger("mousetumor")
 
 CONFIG = {
     # Data
-    "num_workers": 4,
+    "num_workers": 8,
     # Training
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "max_epochs": 150,
-    "batch_size": 4,
-    "val_interval": 5,  # validate every N epochs
+    "max_epochs": 300,
+    "batch_size": 8,
+    "val_interval": 1,  # validate every N epochs
     "dice_weight": 0.75,
     "weight_decay": 1e-4,
+    "deep_supervision": True,
+    "deep_sup_weights": [0.4, 1],
     # Scheduler
-    "learning_rate": 5e-4,
+    "learning_rate": 3e-4,
     "warm_restarts": True,
-    "T_0": 50,
+    "T_0": 60,
     "T_mult": 1,
     "lr_min": 1e-6,
     # Model
@@ -117,7 +120,10 @@ def build_dataloaders(train_files, val_files):
 def build_model(model_name, device):
     func = getattr(architectures, model_name)
 
-    model = func().to(device)
+    if "deep_supervision" in inspect.signature(func).parameters:
+        model = func(deep_supervision=CONFIG["deep_supervision"]).to(device)
+    else:
+        model = func().to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
     logging.info(f"{model_name} parameters: {total_params:,}")
@@ -192,12 +198,17 @@ def train_one_epoch(model, loader, optimizer, loss_fn, device, epoch):
 
             optimizer.zero_grad()
             outputs = model(images)
-            if isinstance(
-                outputs, list
-            ):  # unet++ returns list because of deep_supervision
-                outputs = outputs[-1]
 
-            loss = loss_fn(outputs, labels)
+            if isinstance(outputs, list) and CONFIG["deep_supervision"]:
+                weights = [
+                    CONFIG["deep_sup_weights"][0] for i in range(len(outputs) - 1)
+                ] + [CONFIG["deep_sup_weights"][1]]
+                loss = sum(w * loss_fn(o, labels) for w, o in zip(weights, outputs))
+            else:
+                if isinstance(outputs, list):
+                    outputs = outputs[-1]
+                loss = loss_fn(outputs, labels)
+
             loss.backward()
             optimizer.step()
 
@@ -285,7 +296,9 @@ def train(data_dir, output_dir, datalist_name):
     if CONFIG["seed"] is not None:
         set_determinism(seed=CONFIG["seed"])
     os.makedirs(output_dir, exist_ok=True)
+
     writer = SummaryWriter(log_dir=os.path.join(output_dir, "tensorboard"))
+
     device = torch.device(CONFIG["device"])
 
     train_files = load_decathlon_datalist(
@@ -302,6 +315,7 @@ def train(data_dir, output_dir, datalist_name):
     train_loader, val_loader = build_dataloaders(train_files, val_files)
 
     model = build_model(CONFIG["model_name"], device)
+    writer.add_graph(model, torch.zeros(CONFIG["batch_size"], 1, 64, 64, 64).to(device))
     loss_fn = build_loss()
     optimizer = build_optimizer(model)
     scheduler = build_scheduler(optimizer)
@@ -337,8 +351,10 @@ def train(data_dir, output_dir, datalist_name):
                 best_epoch = epoch
                 torch.save(
                     model.state_dict(),
-                    os.path.join(output_dir, "best_model.pth"),
+                    os.path.join(output_dir, "best_model_weights.pt"),
                 )
+                # scripted = torch.jit.script(model)
+                # torch.jit.save(scripted, "best_model_scripted.pt")
                 logger.info(f"  --> New best model saved (Dice: {best_dice:.4f})")
 
         writer.flush()

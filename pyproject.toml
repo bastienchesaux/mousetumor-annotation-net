@@ -12,6 +12,7 @@ dependencies = [
     "logging>=0.4.9.6",
     "matplotlib>=3.10.8",
     "monai>=1.5.2",
+    "mplcursors>=0.7",
     "napari[all]>=0.6.6",
     "opencv-python>=4.13.0.92",
     "pandas>=2.3.3",
@@ -25,6 +26,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "napari-data-inspection>=1.0.3",
     "pre-commit>=4.5.1",
     "ruff>=0.15.1",
 ]
