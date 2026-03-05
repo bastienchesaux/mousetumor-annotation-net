@@ -305,3 +305,36 @@ def unet_S5D2W16(deep_supervision=False):
         dropout=0.1,
         deep_supervision=deep_supervision,
     )
+
+
+def unet_S4D3W16(deep_supervision=False):
+    return FlexibleUNet(
+        features=(16, 16, 32, 64),
+        n_convs=3,
+        act=("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        norm=("instance", {"affine": True}),
+        dropout=0.1,
+        deep_supervision=deep_supervision,
+    )
+
+
+def unet_S5D1W16(deep_supervision=False):
+    return FlexibleUNet(
+        features=(16, 16, 32, 64, 128),
+        n_convs=1,
+        act=("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        norm=("instance", {"affine": True}),
+        dropout=0.1,
+        deep_supervision=deep_supervision,
+    )
+
+
+def unet_S6D2W16(deep_supervision=False):
+    return FlexibleUNet(
+        features=(16, 16, 32, 64, 128, 256),
+        n_convs=2,
+        act=("LeakyReLU", {"negative_slope": 0.1, "inplace": True}),
+        norm=("instance", {"affine": True}),
+        dropout=0.1,
+        deep_supervision=deep_supervision,
+    )

@@ -57,6 +57,10 @@ def select_projects_prompt(omero_client) -> list[str]:
     typer.echo("\nEnter indices:")
     raw = input("> ")
 
+    if raw.strip().lower() == "all":
+        typer.echo(f"\nSelected: {keys}")
+        return keys
+
     indices = [int(x) for x in raw.strip().split()]
     selected = [keys[i] for i in indices]
 
@@ -78,7 +82,7 @@ def scan_projects(project_names: list[str], omero_client):
 
         df = scanner.view.df
 
-    dfs.append(df)
+        dfs.append(df)
 
     full_df = pd.concat(dfs)
 
@@ -94,7 +98,6 @@ def filter_files(df: pd.DataFrame) -> pd.DataFrame:
     sub_df = df.groupby(["dataset_id", "time"], group_keys=False).apply(
         filter_groups, include_groups=False
     )
-    print(sub_df)
     n_valid = sub_df["class"].eq("corrected_pred").sum()
     print(f"Number of valid pairs: {n_valid}")
 
@@ -104,8 +107,11 @@ def filter_files(df: pd.DataFrame) -> pd.DataFrame:
 @app.command()
 def download_scans(
     save_dir: Annotated[Path, typer.Argument()],
-    skip_existing: Annotated[bool, typer.Option()],
+    skip_existing: Annotated[bool, typer.Option()] = False,
 ):
+    if not os.path.isdir(save_dir):
+        os.mkdir(save_dir)
+
     omero_client = connect_to_omero()
 
     projects = select_projects_prompt(omero_client)
@@ -120,7 +126,7 @@ def download_scans(
         old_spreadsheet = pd.read_csv(spreadsheet_path)
         file_subset_df = pd.concat([old_spreadsheet, file_subset_df])
 
-    file_subset_df.to_csv(os.path.join(save_dir, "scan.csv"))
+    file_subset_df.to_csv(os.path.join(save_dir, "scan.csv"), index=False)
 
     for idx, row in tqdm(
         file_subset_df.iterrows(), desc="Downloading Images", total=len(file_subset_df)

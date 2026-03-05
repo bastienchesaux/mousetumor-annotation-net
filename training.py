@@ -27,6 +27,7 @@ from monai.transforms import (
     Compose,
     EnsureChannelFirstd,
     EnsureTyped,
+    KeepLargestConnectedComponent,
     LoadImaged,
     RandFlipd,
     RandRotate90d,
@@ -171,7 +172,12 @@ def build_metric():
 
 
 def build_post_transforms():
-    post_trans = Compose([AsDiscrete(threshold=0.5)])
+    post_trans = Compose(
+        [
+            AsDiscrete(threshold=0.5),
+            KeepLargestConnectedComponent(applied_labels=[1]),
+        ]
+    )
 
     return post_trans
 

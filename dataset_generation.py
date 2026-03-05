@@ -18,9 +18,18 @@ from pathlib import Path
 import edt
 
 from scipy.ndimage import distance_transform_cdt
+from skimage.measure import block_reduce
 
+from line_profiler import LineProfiler
 
 app = typer.Typer()
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("mousetumor")
 
 
 def full_scan_normalize_hu(image, lb=-1000, ub=500):
@@ -31,7 +40,7 @@ def full_scan_normalize_hu(image, lb=-1000, ub=500):
 
 
 def full_scan_normalize(image, clip_percentile=96):
-    ub = np.percentile(image, 96)
+    ub = np.percentile(image, clip_percentile)
     lb = image.min()
 
     normalized = (image - lb) / (ub - lb)
@@ -82,7 +91,7 @@ def noisy_tumor_center(binary, dist_quantile=0.96):
 
     thresh = np.quantile(dist[dist != 0], dist_quantile)
     if np.count_nonzero(dist > thresh) == 0:
-        logging.info("invalid threshold, using default")
+        logger.info("invalid threshold, using default")
     thresh = min(thresh, dist.max() - 2)  # safety for very small tumors
 
     valid_coords = np.stack(np.where(dist > thresh), -1)
@@ -92,18 +101,45 @@ def noisy_tumor_center(binary, dist_quantile=0.96):
     return np.array(noisy_center)
 
 
+def compute_downsample_ratio(
+    binary,
+    win_center,
+    win_size,
+    safety_margin_px=10,
+    limit=3,
+):
+    object_coords = np.stack(np.nonzero(binary), axis=-1)
+
+    min_bounds = np.min(object_coords, axis=0)
+    max_bounds = np.max(object_coords, axis=0)
+
+    max_extent = max((max_bounds - win_center).max(), (win_center - min_bounds).max())
+
+    downsample = int(np.ceil(max_extent / (win_size // 2 + safety_margin_px)))
+
+    if downsample > limit:
+        raise RuntimeError("Tumor is too big")
+
+    elif downsample > 1:
+        logger.info(
+            f"Tumor doesn't fit in {win_size}³ window: using {downsample * win_size}³"
+        )
+    return downsample
+
+
 def extract_tumor_window(img, labels, target_label, win_size, dist_quantile=0.96):
     binary, offset = extract_binary_tight(labels, target_label)
 
-    if any(dim > win_size for dim in binary.shape):
-        raise RuntimeError(f"Tumor doesn't fit in {win_size}³ window")
+    win_center = noisy_tumor_center(binary, dist_quantile=dist_quantile)
 
-    win_center = noisy_tumor_center(binary, dist_quantile=dist_quantile) + offset
+    ds_ratio = compute_downsample_ratio(binary, win_center, win_size)
+
+    win_center += offset
 
     if labels[win_center[0], win_center[1], win_center[2]] != target_label:
         raise RuntimeError(f"Window center {win_center} outside of tumor")
 
-    half = win_size // 2
+    half = int(ds_ratio * (win_size // 2))
 
     img_padded = np.pad(img, half, mode="constant", constant_values=0)
     lbl_padded = np.pad(labels, half, mode="constant", constant_values=0)
@@ -112,18 +148,22 @@ def extract_tumor_window(img, labels, target_label, win_size, dist_quantile=0.96
     z, y, x = win_center + half
 
     img_win = img_padded[
-        z - half : z + half + win_size % 2,
-        y - half : y + half + win_size % 2,
-        x - half : x + half + win_size % 2,
+        z - half : z + half,
+        y - half : y + half,
+        x - half : x + half,
     ]
     lbl_win = lbl_padded[
-        z - half : z + half + win_size % 2,
-        y - half : y + half + win_size % 2,
-        x - half : x + half + win_size % 2,
+        z - half : z + half,
+        y - half : y + half,
+        x - half : x + half,
     ]
 
     lbl_win = lbl_win == target_label
     lbl_win = lbl_win.astype(bool)
+
+    if ds_ratio > 1:
+        img_win = block_reduce(img_win, block_size=ds_ratio, func=np.median)
+        lbl_win = block_reduce(lbl_win, block_size=ds_ratio, func=np.max).astype(bool)
 
     return img_win, lbl_win
 
@@ -145,16 +185,27 @@ def generate_tumor_windows(
 
     for (case, scan), group in tqdm(scans_df.groupby(["specimen", "time_tag"])):
         if not {"roi", "corrected_pred"}.issubset(group["class"].unique()):
-            logging.warning(f"{case} {scan} not a valid file pair")
+            logger.warning(f"{case} {scan} not a valid file pair")
             continue
 
         img_name = "_".join([case, scan, "roi.tiff"])
         labels_name = "_".join([case, scan, "corrected_pred.tiff"])
 
-        img = tiff.imread(os.path.join(source_scan_dir, img_name))
-        labels = tiff.imread(os.path.join(source_scan_dir, labels_name))
+        try:
+            img = tiff.imread(os.path.join(source_scan_dir, img_name))
+            labels = tiff.imread(os.path.join(source_scan_dir, labels_name))
+        except Exception as e:
+            logging.warning(f"Failed to load {case}_{scan} with: {e}")
+            continue
+
+        if img.shape != labels.shape:
+            logger.warning(f"Skip {case} {scan}: image shapes don't match")
+            continue
 
         img = full_scan_normalize(img)
+
+        lp = LineProfiler()
+        lp_wrapper = lp(extract_tumor_window)
 
         for i in np.unique(labels[labels != 0]):
             try:
@@ -168,7 +219,9 @@ def generate_tumor_windows(
                 ):
                     continue
 
-                img_win, label_win = extract_tumor_window(img, labels, i, win_size)
+                img_win, label_win = lp_wrapper(img, labels, i, win_size)
+
+                # img_win, label_win = extract_tumor_window(img, labels, i, win_size)
 
                 tiff.imwrite(
                     img_path,
@@ -179,7 +232,8 @@ def generate_tumor_windows(
                     label_win.astype(np.uint8),
                 )
             except Exception as e:
-                logging.error(f"Failed to generate {output_name} with {e}")
+                logger.error(f"Failed to generate {output_name} with {e}")
+    lp.dump_stats("output.lprof")
 
 
 def random_empty_window_center(labels, mask, win_size):
@@ -227,14 +281,14 @@ def extract_empty_window(img, labels, lung_mask, win_size):
     z, y, x = win_center + half
 
     img_win = img_padded[
-        z - half : z + half + win_size % 2,
-        y - half : y + half + win_size % 2,
-        x - half : x + half + win_size % 2,
+        z - half : z + half,
+        y - half : y + half,
+        x - half : x + half,
     ]
     lbl_win = lbl_padded[
-        z - half : z + half + win_size % 2,
-        y - half : y + half + win_size % 2,
-        x - half : x + half + win_size % 2,
+        z - half : z + half,
+        y - half : y + half,
+        x - half : x + half,
     ]
 
     lbl_win = lbl_win != 0
@@ -270,7 +324,7 @@ def generate_empty_windows(
 
         match = re.search(pattern, random_file)
         if not match:
-            logging.error(f"pattern not found in {random_file}")
+            logger.error(f"pattern not found in {random_file}")
             continue
         case = match.group("case")
         scan = "scan" + match.group("scan_no")
@@ -290,7 +344,7 @@ def generate_empty_windows(
             continue
 
         if np.count_nonzero(label_win) > 0:
-            logging.error("window is not empty")
+            logger.error("window is not empty")
             continue
 
         output_name = "_".join([case, scan, f"empty{valid_count}.tiff"])

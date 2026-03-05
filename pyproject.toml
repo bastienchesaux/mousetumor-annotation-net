@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "edt>=3.1.0",
+    "grpcio==1.71.0",
     "ipython>=8.38.0",
     "itk>=5.4.5",
     "line-profiler>=5.0.1",
@@ -17,6 +18,7 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "pandas>=2.3.3",
     "pyvista>=0.47.0",
+    "scikit-image>=0.25.2",
     "seaborn>=0.13.2",
     "setuptools==80.8.0",
     "tensorboard>=2.20.0",

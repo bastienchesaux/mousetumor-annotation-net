@@ -1,4 +1,5 @@
 import os
+import inspect
 import json
 
 import numpy as np
@@ -16,6 +17,8 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+
+import time
 
 from training import build_transforms, build_post_transforms
 from monai.metrics import DiceMetric
@@ -35,12 +38,20 @@ from pathlib import Path
 app = typer.Typer()
 
 
-def load_model(model_name, checkpoint_path, device=None):
+def load_model(
+    model_name,
+    checkpoint_path,
+    device=None,
+    deep_supervision=False,
+):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     func = getattr(architectures, model_name)
 
-    model = func()
+    if "deep_supervision" in inspect.signature(func).parameters:
+        model = func(deep_supervision=deep_supervision).to(device)
+    else:
+        model = func().to(device)
 
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.to(device)
@@ -147,8 +158,6 @@ def dice_scatter_plot(
     run_path: Annotated[Path, typer.Argument()],
     load: Annotated[bool, typer.Option()] = False,
 ):
-    print(matplotlib.get_backend())
-
     if load and os.path.isfile(os.path.join(run_path, "dice_scores.csv")):
         df = pd.read_csv(os.path.join(run_path, "dice_scores.csv"))
 
@@ -161,7 +170,12 @@ def dice_scatter_plot(
 
         model_name = config["model_name"]
 
-        model = load_model(model_name, os.path.join(run_path, "best_model.pth"), device)
+        model = load_model(
+            model_name,
+            os.path.join(run_path, "best_model_weights.pt"),
+            device,
+            deep_supervision=config["deep_supervision"],
+        )
 
         data_dir = config["dataset"]
         datalist_path = os.path.join(run_path, "datalist.json")
@@ -187,12 +201,16 @@ def dice_scatter_plot(
 
         volumes = compute_volumes(file_paths)
 
-        df = pd.DataFrame({"dice": dice_scores, "volume": volumes, "name": file_names})
+        radii = np.cbrt(3 * volumes / (4 * np.pi))
+
+        df = pd.DataFrame(
+            {"dice": dice_scores, "approx. radius": radii, "name": file_names}
+        )
 
         df.to_csv(os.path.join(run_path, "dice_scores.csv"), index=False)
 
     plt.figure()
-    ax = sns.scatterplot(data=df, x="volume", y="dice")
+    ax = sns.scatterplot(data=df, x="approx. radius", y="dice")
 
     cursor = mplcursors.cursor(ax.collections[0], hover=True)
 
@@ -214,7 +232,12 @@ def show_prediction(
 
     model_name = config["model_name"]
 
-    model = load_model(model_name, os.path.join(run_path, "best_model.pth"), device)
+    model = load_model(
+        model_name,
+        os.path.join(run_path, "best_model_weights.pt"),
+        device,
+        deep_supervision=config["deep_supervision"],
+    )
 
     data_dir = config["dataset"]
 
@@ -259,7 +282,10 @@ def show_random_prediction(
     model_name = config["model_name"]
 
     model = load_model(
-        model_name, os.path.join(run_path, "best_model_weights.pt"), device
+        model_name,
+        os.path.join(run_path, "best_model_weights.pt"),
+        device,
+        deep_supervision=config["deep_supervision"],
     )
 
     data_dir = config["dataset"]
@@ -286,10 +312,12 @@ def show_random_prediction(
         image = tiff.imread(dict["image"])
         labels = tiff.imread(dict["label"])
 
+        start = time.perf_counter()
         mask, dice_score = single_image_prediction(
             model, image, labels, post_trans, metric_fn, device
         )
-        print(f"{image_name} DICE: {dice_score}")
+        end = time.perf_counter()
+        print(f"{image_name} DICE: {dice_score}  exec. time: {end - start:.3f}s")
 
         viewer.add_image(image, name=image_name, colormap="plasma")
         gt_layer = viewer.add_labels(labels, name=f"{image_name} - GT")
